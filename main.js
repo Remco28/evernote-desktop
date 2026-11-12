@@ -30,7 +30,7 @@ const PROBE_COOLDOWN_MS = 10 * 60 * 1000; // minimum gap between renewal attempt
 const AUTH_COOKIES = new Set(['auth', 'userdata_loggedIn']);
 const AUTH_KEEP_MS = 100 * 60 * 1000; // a little under the server's 2 hours
 const LONG_SLEEP_MS = 60 * 60 * 1000; // asleep at least this long: renew before letting the page run
-const NETWORK_WAIT_MS = 60 * 1000; // after waking, how long to wait for the network to come back
+const NETWORK_WAIT_MS = 10 * 60 * 1000; // after waking, how long to wait for Evernote to be reachable again
 const ALLOWED_POPUP_HOSTS = [/(^|\.)evernote\.com$/, /(^|\.)google\.com$/, /(^|\.)apple\.com$/];
 const LOGGED_COOKIES = new Set([
   'auth', 'userdata_loggedIn', 'evernote-session', 'session_info', 'lastAuthentication', 'clipper-sso',
@@ -101,6 +101,10 @@ let firstWindowCreated = false; // only the very first window may start hidden (
 let suspendedAt = 0; // when powerMonitor said we were going to sleep
 let lastTick = Date.now(); // heartbeat: a big gap between ticks means the machine was asleep
 let wakeHandling = false;
+let wokeAt = 0; // last time we came back from sleep
+let mainLoadFailed = false; // the visible window is showing a failed page load
+let recovering = false;
+let lastAutoReload = 0;
 
 // ---------- cookie persistence + logging ----------
 function watchCookies(ses) {
@@ -216,8 +220,8 @@ async function renewIfNeeded(reason, { force = false } = {}) {
     if (ok) {
       loginNoticeShown = false;
       // The visible window may be stuck on the login page from before the renewal: bring it back.
-      if (win && !win.isDestroyed() && onLoginHost(win.webContents.getURL())) {
-        log('renewed while main window was on the login page: reloading app');
+      if (win && !win.isDestroyed() && (onLoginHost(win.webContents.getURL()) || mainLoadFailed)) {
+        log('renewed while main window was on the login page or a failed load: reloading app');
         win.loadURL(APP_URL);
       }
     } else {
@@ -257,18 +261,62 @@ async function simulateExpiry() {
 const PARKED_PAGE = 'data:text/html;charset=utf-8,' + encodeURIComponent(
   '<body style="font:15px system-ui,sans-serif;color:#555;display:grid;place-items:center;height:90vh">Reconnecting to Evernote…</body>');
 
-async function waitForNetwork() {
-  const deadline = Date.now() + NETWORK_WAIT_MS;
-  while (!net.isOnline() && Date.now() < deadline) await sleep(1000);
-  const online = net.isOnline();
-  if (online) await sleep(2000); // DNS and Wi-Fi often need a moment more
-  return online;
+// net.isOnline() only says an interface is up; after a wake Wi-Fi can take minutes (seen: 2m15s) to really
+// connect. So check that Evernote actually answers, from a cookie-less in-memory session.
+async function evernoteReachable() {
+  if (!net.isOnline()) return false;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 5000);
+    const res = await session.fromPartition('netcheck').fetch('https://www.evernote.com/robots.txt',
+      { method: 'HEAD', signal: ctl.signal, cache: 'no-store' });
+    clearTimeout(t);
+    return res.status > 0;
+  } catch { return false; }
+}
+
+async function waitForNetwork(maxMs = NETWORK_WAIT_MS) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (await evernoteReachable()) return true;
+    await sleep(2000);
+  }
+  return false;
+}
+
+// Evernote's page loads parts of itself on demand. If one is requested while the network is still down
+// after a wake, the page shows "Loading chunk ... failed" and never retries. Reload it once Evernote is
+// reachable again, but only shortly after a wake (otherwise we might interrupt typing for a minor glitch).
+async function recoverFromFailedScript() {
+  if (recovering || Date.now() - wokeAt > 10 * 60 * 1000) return;
+  recovering = true;
+  try {
+    const online = await waitForNetwork(30 * 60 * 1000);
+    if (online && Date.now() - lastAutoReload > 5 * 60 * 1000 && win && !win.isDestroyed()) {
+      lastAutoReload = Date.now();
+      log('reloading page: part of it failed to load while the network was down');
+      win.loadURL(APP_URL);
+    }
+  } finally { recovering = false; }
+}
+
+function watchLoadErrors(ses) {
+  ses.webRequest.onErrorOccurred({ urls: ['https://*.evernote.com/*'] }, (d) => {
+    if (!['mainFrame', 'script', 'stylesheet'].includes(d.resourceType)) return;
+    if (d.error === 'net::ERR_ABORTED') return; // normal on navigation/redirect
+    log(`load error ${d.error} ${safeUrl(d.url)} type=${d.resourceType}`);
+    const fromMainWindow = win && !win.isDestroyed() && (d.webContentsId === undefined || d.webContentsId === win.webContents.id); // workers carry no id
+    if (d.resourceType !== 'mainFrame' && fromMainWindow) {
+      recoverFromFailedScript();
+    }
+  });
 }
 
 async function handleWake(reason, sleptMs) {
   if (wakeHandling) return;
   wakeHandling = true;
   suspendedAt = 0;
+  wokeAt = Date.now();
   const ses = session.defaultSession;
   let parked = false;
   try {
@@ -343,7 +391,10 @@ function createWindow({ deferLoad = false } = {}) {
   });
 
   wc.on('did-navigate', (_e, url) => log(`nav ${safeUrl(url)}`));
-  wc.on('did-fail-load', (_e, code, desc, url, isMain) => { if (isMain) log(`load FAILED ${code} ${desc} ${safeUrl(url)}`); });
+  wc.on('did-fail-load', (_e, code, desc, url, isMain) => {
+    if (isMain && code !== -3) { mainLoadFailed = true; log(`load FAILED ${code} ${desc} ${safeUrl(url)}`); }
+  });
+  wc.on('did-finish-load', () => { mainLoadFailed = false; });
   wc.on('render-process-gone', (_e, d) => log(`renderer gone: ${d.reason}`));
 
   const saveBounds = () => { if (!win.isMaximized() && !win.isMinimized()) { settings.bounds = win.getBounds(); saveSettings(); } };
@@ -437,6 +488,7 @@ if (!app.requestSingleInstanceLock()) {
     const ses = session.defaultSession;
     watchCookies(ses);
     watchResponses(ses);
+    watchLoadErrors(ses);
     setupPermissions(ses);
     buildMenu();
     createTray();
@@ -450,7 +502,7 @@ if (!app.requestSingleInstanceLock()) {
 
     setInterval(() => renewIfNeeded('timer').catch((e) => log(`renew error ${e.message}`)), CHECK_EVERY_MS);
     setInterval(() => ses.cookies.flushStore().catch(() => {}), 60 * 1000);
-    powerMonitor.on('suspend', () => { suspendedAt = Date.now(); log('suspend'); });
+    powerMonitor.on('suspend', () => { if (!suspendedAt) { suspendedAt = Date.now(); log('suspend'); } });
     powerMonitor.on('resume', () => handleWake('resume', Date.now() - (suspendedAt || lastTick)));
     powerMonitor.on('unlock-screen', () => renewIfNeeded('unlock').catch(() => {}));
     // Backup for a missed resume event: timers stop while asleep, so a long gap between ticks means we slept.
