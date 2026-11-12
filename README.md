@@ -34,14 +34,18 @@ Needs a 64-bit Intel/AMD computer. No Node.js or other software required.
 - Starts at login if you choose (the installer asks).
 
 **Why you were being logged out:** Evernote re-issues its login cookie every ~40 minutes as a *session-only*
-cookie, which browsers throw away whenever they restart or sleep. This app keeps those cookies for 30 days.
-That's the whole trick.
+cookie, which browsers throw away whenever they restart or sleep. This app keeps your 30-day sign-in cookie,
+and gets a fresh login cookie from it whenever the short one lapses. After the computer has been asleep for an
+hour or more, it renews the login before the Evernote page wakes up, because Evernote answers an out-of-date
+login by signing you out completely.
 
 ## If you get logged out anyway
 
 Press **Alt** to show the menu bar, then **File > Open log folder** and open `events.log`. Look for
 `LOGIN REQUIRED` and the lines just before it. They show whether a cookie expired or Evernote refused to renew.
-**File > Test: simulate expired login** checks that renewal works on your machine.
+Lines starting with `wake` and `http` show what happened after sleep and which Evernote address signed you out.
+**File > Test: simulate expired login** and **File > Test: simulate waking from a long sleep** check that renewal
+works on your machine.
 
 ## Privacy
 

@@ -7,12 +7,15 @@
  * renewed from a 30-day SSO cookie (`evernote-session`). Browsers/PWAs on this machine lose that
  * renewal and fall back to the login + 6-digit-code screen. This app:
  *   1. keeps ONE permanent profile used only for Evernote,
- *   2. turns any session-only Evernote cookie into a persistent one,
- *   3. proactively renews the 2-hour `auth` cookie from the long-lived session in the background,
+ *   2. turns any session-only Evernote cookie into a persistent one, EXCEPT the 2-hour login cookies,
+ *      which are kept only as long as Evernote's server honors them (a stale `auth` sent after a long
+ *      sleep is answered by Evernote ending the whole 30-day session: seen 2026-11-12),
+ *   3. renews the 2-hour `auth` cookie from the long-lived session in the background, and after a long
+ *      sleep renews it BEFORE the page wakes up and talks to Evernote,
  *   4. logs (metadata only, never cookie values) exactly what happened if a login is ever needed.
  */
 
-const { app, BrowserWindow, Tray, Menu, Notification, dialog, session, shell, powerMonitor, nativeImage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, Notification, dialog, session, shell, powerMonitor, nativeImage, net } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 
@@ -22,6 +25,12 @@ const PERSIST_DAYS = 30; // lifetime given to cookies that arrive as session-onl
 const CHECK_EVERY_MS = 2 * 60 * 1000; // how often we look at whether `auth` is still present
 const PROBE_TIMEOUT_MS = 25 * 1000; // how long the hidden renewal window gets to produce a fresh `auth`
 const PROBE_COOLDOWN_MS = 10 * 60 * 1000; // minimum gap between renewal attempts
+// Evernote's login token behind `auth` is good for ~2 hours on the server (a fresh login sets
+// exactly 2h; the page re-issues it every ~40 min while awake). These cookies are only kept that long.
+const AUTH_COOKIES = new Set(['auth', 'userdata_loggedIn']);
+const AUTH_KEEP_MS = 100 * 60 * 1000; // a little under the server's 2 hours
+const LONG_SLEEP_MS = 60 * 60 * 1000; // asleep at least this long: renew before letting the page run
+const NETWORK_WAIT_MS = 60 * 1000; // after waking, how long to wait for the network to come back
 const ALLOWED_POPUP_HOSTS = [/(^|\.)evernote\.com$/, /(^|\.)google\.com$/, /(^|\.)apple\.com$/];
 const LOGGED_COOKIES = new Set([
   'auth', 'userdata_loggedIn', 'evernote-session', 'session_info', 'lastAuthentication', 'clipper-sso',
@@ -72,7 +81,10 @@ function saveSettings() {
 
 // Strip query/hash: they can hold tokens. We only ever log host + path.
 function safeUrl(u) {
-  try { const p = new URL(u); return `${p.host}${p.pathname}`; } catch { return '(unparseable)'; }
+  try {
+    const p = new URL(u);
+    return /^https?:$/.test(p.protocol) ? `${p.host}${p.pathname}` : p.protocol;
+  } catch { return '(unparseable)'; }
 }
 
 const fmtExp = (c) => (c.session || !c.expirationDate ? 'SESSION' : new Date(c.expirationDate * 1000).toISOString());
@@ -86,6 +98,9 @@ let probing = false;
 let lastProbeAt = 0;
 let loginNoticeShown = false;
 let firstWindowCreated = false; // only the very first window may start hidden (--hidden)
+let suspendedAt = 0; // when powerMonitor said we were going to sleep
+let lastTick = Date.now(); // heartbeat: a big gap between ticks means the machine was asleep
+let wakeHandling = false;
 
 // ---------- cookie persistence + logging ----------
 function watchCookies(ses) {
@@ -107,11 +122,11 @@ function watchCookies(ses) {
         secure: cookie.secure,
         httpOnly: cookie.httpOnly,
         sameSite: cookie.sameSite,
-        expirationDate: Math.floor(Date.now() / 1000) + PERSIST_DAYS * 86400,
+        expirationDate: Math.floor((Date.now() + (AUTH_COOKIES.has(cookie.name) ? AUTH_KEEP_MS : PERSIST_DAYS * 86400_000)) / 1000),
       };
       if (!cookie.hostOnly) details.domain = cookie.domain;
       ses.cookies.set(details).then(
-        () => log(`promoted session cookie ${cookie.name} (${cookie.domain}) to ${PERSIST_DAYS}d`),
+        () => log(`promoted session cookie ${cookie.name} (${cookie.domain}) to ${AUTH_COOKIES.has(cookie.name) ? `${AUTH_KEEP_MS / 60000}min` : `${PERSIST_DAYS}d`}`),
         (err) => log(`promote FAILED for ${cookie.name}: ${err.message}`),
       );
     }
@@ -121,6 +136,47 @@ function watchCookies(ses) {
 async function evernoteCookies(ses, name) {
   const all = await ses.cookies.get({ name });
   return all.filter((c) => isEvernoteHost(c.domain.replace(/^\./, '')));
+}
+
+async function removeCookie(ses, c) {
+  await ses.cookies.remove(`https://${c.domain.replace(/^\./, '')}${c.path || '/'}`, c.name);
+}
+
+// Versions before 2026-11-12 kept `auth` for 30 days. Such a cookie outlives the server's token, so drop it.
+async function dropLegacyAuth(ses) {
+  const limit = Date.now() / 1000 + 2 * 3600 + 300; // nothing Evernote issues lives longer than 2h
+  for (const name of AUTH_COOKIES) {
+    for (const c of await evernoteCookies(ses, name)) {
+      if (!c.session && c.expirationDate > limit) {
+        log(`dropping over-long ${name} cookie (exp=${fmtExp(c)}) left by an older version`);
+        await removeCookie(ses, c);
+      }
+    }
+  }
+}
+
+// Diagnostics: which Evernote URL set or cleared a login cookie, and any 401/403. Names, status and path
+// only: never cookie values or query strings.
+function watchResponses(ses) {
+  ses.webRequest.onHeadersReceived({ urls: ['https://*.evernote.com/*'] }, (d, cb) => {
+    try {
+      const setCookies = Object.entries(d.responseHeaders || {})
+        .filter(([k]) => k.toLowerCase() === 'set-cookie').flatMap(([, v]) => v);
+      const touched = [];
+      for (const sc of setCookies) {
+        const name = sc.split('=')[0].trim();
+        if (!LOGGED_COOKIES.has(name)) continue;
+        const exp = /;\s*expires=([^;]+)/i.exec(sc);
+        const maxAge = /;\s*max-age=(-?\d+)/i.exec(sc);
+        const cleared = (maxAge && Number(maxAge[1]) <= 0) || (exp && Date.parse(exp[1]) < Date.now());
+        touched.push(`${cleared ? '-' : '+'}${name}`);
+      }
+      if (touched.length || d.statusCode === 401 || d.statusCode === 403) {
+        log(`http ${d.statusCode} ${d.method} ${safeUrl(d.url)} type=${d.resourceType}${touched.length ? ` cookies=${touched.join(',')}` : ''}`);
+      }
+    } catch { /* diagnostics must never break requests */ }
+    cb({});
+  });
 }
 
 // ---------- background session renewal ----------
@@ -181,10 +237,8 @@ async function renewIfNeeded(reason, { force = false } = {}) {
 async function simulateExpiry() {
   const ses = session.defaultSession;
   log('TEST simulate expiry: removing auth + userdata_loggedIn');
-  for (const name of ['auth', 'userdata_loggedIn']) {
-    for (const c of await evernoteCookies(ses, name)) {
-      await ses.cookies.remove(`https://${c.domain.replace(/^\./, '')}${c.path || '/'}`, name);
-    }
+  for (const name of AUTH_COOKIES) {
+    for (const c of await evernoteCookies(ses, name)) await removeCookie(ses, c);
   }
   const ok = await renewIfNeeded('simulate', { force: true });
   log(`TEST simulate expiry RESULT renewed=${ok}`);
@@ -194,6 +248,56 @@ async function simulateExpiry() {
     message: ok ? 'Renewal worked: no sign-in needed.' : 'Renewal failed: Evernote wants you to sign in again.',
     detail: ok ? 'The 2-hour login cookie was re-issued from your 30-day session.' : 'Details are in the log (File > Open log folder).',
   });
+}
+
+// ---------- waking from sleep ----------
+// After a long sleep the page would immediately send its old login token, and Evernote answers a stale
+// token by ending the whole session. So: take the page off Evernote first, drop the 2-hour cookies,
+// wait for the network, renew from the 30-day session in a hidden window, and only then reload the page.
+const PARKED_PAGE = 'data:text/html;charset=utf-8,' + encodeURIComponent(
+  '<body style="font:15px system-ui,sans-serif;color:#555;display:grid;place-items:center;height:90vh">Reconnecting to Evernote…</body>');
+
+async function waitForNetwork() {
+  const deadline = Date.now() + NETWORK_WAIT_MS;
+  while (!net.isOnline() && Date.now() < deadline) await sleep(1000);
+  const online = net.isOnline();
+  if (online) await sleep(2000); // DNS and Wi-Fi often need a moment more
+  return online;
+}
+
+async function handleWake(reason, sleptMs) {
+  if (wakeHandling) return;
+  wakeHandling = true;
+  suspendedAt = 0;
+  const ses = session.defaultSession;
+  let parked = false;
+  try {
+    const [auth, sso] = await Promise.all([evernoteCookies(ses, 'auth'), evernoteCookies(ses, 'evernote-session')]);
+    log(`wake reason=${reason} slept=${Math.round(sleptMs / 60000)}min auth=${auth.length ? fmtExp(auth[0]) : 'none'} session=${sso.length ? fmtExp(sso[0]) : 'none'}`);
+    if (sleptMs < LONG_SLEEP_MS) {
+      if (await waitForNetwork()) await renewIfNeeded(reason);
+      return;
+    }
+    if (win && !win.isDestroyed() && isEvernoteHost(safeUrl(win.webContents.getURL()).split('/')[0])) {
+      win.webContents.stop();
+      win.loadURL(PARKED_PAGE);
+      parked = true;
+    }
+    for (const name of AUTH_COOKIES) {
+      for (const c of await evernoteCookies(ses, name)) await removeCookie(ses, c);
+    }
+    const online = await waitForNetwork();
+    log(`wake: page ${parked ? 'parked' : 'not open'}, 2h cookies dropped, network ${online ? 'up' : 'still down'}`);
+    while (probing) await sleep(500);
+    if (online && sso.length) await renewIfNeeded(reason, { force: true });
+    else if (!sso.length) log('wake: no 30-day session cookie left to renew from');
+  } catch (err) {
+    log(`wake ERROR ${err.message}`);
+  } finally {
+    lastTick = Date.now();
+    wakeHandling = false;
+    if (parked && win && !win.isDestroyed()) win.loadURL(APP_URL);
+  }
 }
 
 function notifyLoginNeeded() {
@@ -264,6 +368,7 @@ function buildMenu() {
         { label: 'Close window to tray', type: 'checkbox', checked: settings.closeToTray, click: (i) => { settings.closeToTray = i.checked; saveSettings(); } },
         { label: 'Open log folder', click: () => shell.showItemInFolder(logPath()) },
         { label: 'Test: simulate expired login', click: () => simulateExpiry().catch((e) => log(`simulate error ${e.message}`)) },
+        { label: 'Test: simulate waking from a long sleep', click: () => handleWake('simulate-sleep', LONG_SLEEP_MS) },
         { type: 'separator' },
         { label: 'Quit', accelerator: 'CmdOrCtrl+Q', click: () => { quitting = true; app.quit(); } },
       ],
@@ -331,21 +436,35 @@ if (!app.requestSingleInstanceLock()) {
 
     const ses = session.defaultSession;
     watchCookies(ses);
+    watchResponses(ses);
     setupPermissions(ses);
     buildMenu();
     createTray();
     // Renew first if the 2h cookie lapsed while the app was closed, so the page opens logged in.
     createWindow({ deferLoad: true });
-    renewIfNeeded('startup')
+    dropLegacyAuth(ses)
+      .catch((e) => log(`legacy auth cleanup error ${e.message}`))
+      .then(() => renewIfNeeded('startup'))
       .catch((e) => log(`startup renew error ${e.message}`))
       .finally(() => { if (win && !win.isDestroyed() && !win.webContents.getURL()) win.loadURL(APP_URL); });
 
     setInterval(() => renewIfNeeded('timer').catch((e) => log(`renew error ${e.message}`)), CHECK_EVERY_MS);
     setInterval(() => ses.cookies.flushStore().catch(() => {}), 60 * 1000);
-    powerMonitor.on('resume', () => setTimeout(() => renewIfNeeded('resume').catch(() => {}), 5000));
+    powerMonitor.on('suspend', () => { suspendedAt = Date.now(); log('suspend'); });
+    powerMonitor.on('resume', () => handleWake('resume', Date.now() - (suspendedAt || lastTick)));
     powerMonitor.on('unlock-screen', () => renewIfNeeded('unlock').catch(() => {}));
+    // Backup for a missed resume event: timers stop while asleep, so a long gap between ticks means we slept.
+    setInterval(() => {
+      const now = Date.now();
+      const gap = now - lastTick;
+      lastTick = now;
+      if (gap >= LONG_SLEEP_MS) handleWake('clock-jump', gap);
+    }, 15 * 1000);
 
     // Smoke-test hook: run for N ms, print status, quit.
+    if (process.env.EVERNOTE_SMOKE_WAKE_MS) {
+      setTimeout(() => handleWake('smoke', LONG_SLEEP_MS), Number(process.env.EVERNOTE_SMOKE_WAKE_MS));
+    }
     if (process.env.EVERNOTE_SMOKE_MS) {
       setTimeout(async () => {
         const wc = win?.webContents;
