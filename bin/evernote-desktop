@@ -1,0 +1,4 @@
+#!/bin/sh
+# Launcher: resolves the project dir (works through symlinks) and starts Electron.
+DIR=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+exec "$DIR/node_modules/electron/dist/electron" "$DIR" "$@"

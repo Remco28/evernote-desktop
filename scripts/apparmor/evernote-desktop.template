@@ -1,0 +1,13 @@
+# Lets this checkout's Electron binary create user namespaces (needed for Chromium's sandbox on
+# Ubuntu 24.04+/26.04, where AppArmor blocks them for unconfined apps). Same shape as Ubuntu's own
+# /etc/apparmor.d/obsidian profile: it confines nothing, it only grants `userns` to this one binary.
+
+abi <abi/5.0>,
+include <tunables/global>
+
+profile evernote-desktop @ELECTRON_PATH@ flags=(unconfined) {
+  userns,
+  @{exec_path} mr,
+
+  include if exists <local/evernote-desktop>
+}

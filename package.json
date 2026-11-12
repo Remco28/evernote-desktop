@@ -1,0 +1,34 @@
+{
+  "name": "evernote-desktop",
+  "version": "0.1.0",
+  "description": "A small, dedicated desktop window for Evernote's web app, built to keep you logged in.",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "install-launcher": "sh scripts/install.sh",
+    "uninstall-launcher": "sh scripts/uninstall.sh"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^45.3.0"
+  },
+  "allowScripts": {
+    "electron@45.3.0": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Remco28/evernote-desktop.git"
+  },
+  "keywords": [
+    "evernote",
+    "electron",
+    "linux",
+    "desktop",
+    "wrapper",
+    "session",
+    "login"
+  ],
+  "author": "Remco28",
+  "homepage": "https://github.com/Remco28/evernote-desktop#readme"
+}
