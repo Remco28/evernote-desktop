@@ -12,7 +12,11 @@
  *      sleep is answered by Evernote ending the whole 30-day session: seen 2026-11-12),
  *   3. renews the 2-hour `auth` cookie from the long-lived session in the background, and after a long
  *      sleep renews it BEFORE the page wakes up and talks to Evernote,
- *   4. logs (metadata only, never cookie values) exactly what happened if a login is ever needed.
+ *   4. logs (metadata only, never cookie values) exactly what happened if a login is ever needed,
+ *   5. stops the page from signing itself out. When an API call gets a 401 (stale token after a sleep),
+ *      Evernote's page navigates to /Logout.action, which goes on to accounts.../auth/signoff and deletes
+ *      the 30-day session (seen 2026-11-14 after a 42-minute sleep). That navigation is cancelled unless
+ *      the user asked to sign out, and the session is renewed instead.
  */
 
 const { app, BrowserWindow, Tray, Menu, Notification, dialog, session, shell, powerMonitor, nativeImage, net } = require('electron');
@@ -29,7 +33,11 @@ const PROBE_COOLDOWN_MS = 10 * 60 * 1000; // minimum gap between renewal attempt
 // exactly 2h; the page re-issues it every ~40 min while awake). These cookies are only kept that long.
 const AUTH_COOKIES = new Set(['auth', 'userdata_loggedIn']);
 const AUTH_KEEP_MS = 100 * 60 * 1000; // a little under the server's 2 hours
-const LONG_SLEEP_MS = 60 * 60 * 1000; // asleep at least this long: renew before letting the page run
+// Asleep at least this long: renew before letting the page run. Was 60 min, but on 2026-11-14 a 42-minute
+// sleep left a 73-minute-old token that Evernote rejected (401) as soon as the page woke.
+const LONG_SLEEP_MS = 15 * 60 * 1000;
+const SIGN_OUT_URLS = ['https://www.evernote.com/Logout.action*', 'https://accounts.evernote.com/auth/signoff*'];
+const USER_SIGN_OUT_WINDOW_MS = 5 * 1000; // a sign-out within this long of a click/keypress counts as the user's
 const NETWORK_WAIT_MS = 10 * 60 * 1000; // after waking, how long to wait for Evernote to be reachable again
 const ALLOWED_POPUP_HOSTS = [/(^|\.)evernote\.com$/, /(^|\.)google\.com$/, /(^|\.)apple\.com$/];
 const LOGGED_COOKIES = new Set([
@@ -105,6 +113,10 @@ let wokeAt = 0; // last time we came back from sleep
 let mainLoadFailed = false; // the visible window is showing a failed page load
 let recovering = false;
 let lastAutoReload = 0;
+let resetting = false;
+let lastUserInputAt = 0; // last click/keypress in the main window
+let last401At = 0; // last 401 from Evernote
+let signOutAllowedUntil = 0; // set by the menu's "Sign out" and by a user-initiated Logout.action
 
 // ---------- cookie persistence + logging ----------
 function watchCookies(ses) {
@@ -175,12 +187,40 @@ function watchResponses(ses) {
         const cleared = (maxAge && Number(maxAge[1]) <= 0) || (exp && Date.parse(exp[1]) < Date.now());
         touched.push(`${cleared ? '-' : '+'}${name}`);
       }
+      if (d.statusCode === 401) last401At = Date.now();
       if (touched.length || d.statusCode === 401 || d.statusCode === 403) {
         log(`http ${d.statusCode} ${d.method} ${safeUrl(d.url)} type=${d.resourceType}${touched.length ? ` cookies=${touched.join(',')}` : ''}`);
       }
     } catch { /* diagnostics must never break requests */ }
     cb({});
   });
+}
+
+// ---------- sign-out guard ----------
+// Evernote's page signs itself out (Logout.action -> accounts/auth/signoff) after a 401, which deletes the
+// 30-day session. Let a sign-out through only when the user clearly asked for it; otherwise cancel it and
+// renew the session instead.
+function guardSignOut(ses) {
+  ses.webRequest.onBeforeRequest({ urls: SIGN_OUT_URLS }, (d, cb) => {
+    const now = Date.now();
+    const userClicked = now - lastUserInputAt < USER_SIGN_OUT_WINDOW_MS && now - last401At > 15 * 1000;
+    if (now < signOutAllowedUntil || userClicked) {
+      signOutAllowedUntil = Math.max(signOutAllowedUntil, now + 30 * 1000); // let the signoff redirect through too
+      log(`sign-out allowed ${safeUrl(d.url)} (${userClicked ? 'user input' : 'menu'})`);
+      cb({});
+      return;
+    }
+    log(`sign-out BLOCKED ${safeUrl(d.url)} type=${d.resourceType} last401=${last401At ? `${Math.round((now - last401At) / 1000)}s ago` : 'never'}: renewing instead`);
+    cb({ cancel: true });
+    resetSession('blocked-sign-out').catch((e) => log(`reset error ${e.message}`));
+  });
+}
+
+function signOut() {
+  signOutAllowedUntil = Date.now() + 30 * 1000;
+  log('sign-out requested from menu');
+  showWindow();
+  win?.loadURL('https://www.evernote.com/Logout.action');
 }
 
 // ---------- background session renewal ----------
@@ -312,20 +352,14 @@ function watchLoadErrors(ses) {
   });
 }
 
-async function handleWake(reason, sleptMs) {
-  if (wakeHandling) return;
-  wakeHandling = true;
-  suspendedAt = 0;
-  wokeAt = Date.now();
+// Take the page off Evernote, drop the 2-hour cookies, wait for the network, renew from the 30-day session
+// in a hidden window, then reload the page. Returns after the page has been sent back to Evernote.
+async function resetSession(reason) {
+  if (resetting) return;
+  resetting = true;
   const ses = session.defaultSession;
   let parked = false;
   try {
-    const [auth, sso] = await Promise.all([evernoteCookies(ses, 'auth'), evernoteCookies(ses, 'evernote-session')]);
-    log(`wake reason=${reason} slept=${Math.round(sleptMs / 60000)}min auth=${auth.length ? fmtExp(auth[0]) : 'none'} session=${sso.length ? fmtExp(sso[0]) : 'none'}`);
-    if (sleptMs < LONG_SLEEP_MS) {
-      if (await waitForNetwork()) await renewIfNeeded(reason);
-      return;
-    }
     if (win && !win.isDestroyed() && isEvernoteHost(safeUrl(win.webContents.getURL()).split('/')[0])) {
       win.webContents.stop();
       win.loadURL(PARKED_PAGE);
@@ -334,17 +368,39 @@ async function handleWake(reason, sleptMs) {
     for (const name of AUTH_COOKIES) {
       for (const c of await evernoteCookies(ses, name)) await removeCookie(ses, c);
     }
+    const sso = await evernoteCookies(ses, 'evernote-session');
     const online = await waitForNetwork();
-    log(`wake: page ${parked ? 'parked' : 'not open'}, 2h cookies dropped, network ${online ? 'up' : 'still down'}`);
+    log(`reset reason=${reason}: page ${parked ? 'parked' : 'not open'}, 2h cookies dropped, network ${online ? 'up' : 'still down'}`);
     while (probing) await sleep(500);
     if (online && sso.length) await renewIfNeeded(reason, { force: true });
-    else if (!sso.length) log('wake: no 30-day session cookie left to renew from');
+    else if (!sso.length) log('reset: no 30-day session cookie left to renew from');
+  } catch (err) {
+    log(`reset ERROR ${err.message}`);
+  } finally {
+    resetting = false;
+    if (parked && win && !win.isDestroyed()) win.loadURL(APP_URL);
+  }
+}
+
+async function handleWake(reason, sleptMs) {
+  if (wakeHandling) return;
+  wakeHandling = true;
+  suspendedAt = 0;
+  wokeAt = Date.now();
+  const ses = session.defaultSession;
+  try {
+    const [auth, sso] = await Promise.all([evernoteCookies(ses, 'auth'), evernoteCookies(ses, 'evernote-session')]);
+    log(`wake reason=${reason} slept=${Math.round(sleptMs / 60000)}min auth=${auth.length ? fmtExp(auth[0]) : 'none'} session=${sso.length ? fmtExp(sso[0]) : 'none'}`);
+    if (sleptMs < LONG_SLEEP_MS) {
+      if (await waitForNetwork()) await renewIfNeeded(reason);
+      return;
+    }
+    await resetSession(reason);
   } catch (err) {
     log(`wake ERROR ${err.message}`);
   } finally {
     lastTick = Date.now();
     wakeHandling = false;
-    if (parked && win && !win.isDestroyed()) win.loadURL(APP_URL);
   }
 }
 
@@ -391,6 +447,8 @@ function createWindow({ deferLoad = false } = {}) {
   });
 
   wc.on('did-navigate', (_e, url) => log(`nav ${safeUrl(url)}`));
+  const USER_INPUT = new Set(['mouseDown', 'keyDown', 'rawKeyDown', 'touchStart', 'gestureTap']);
+  wc.on('input-event', (_e, input) => { if (USER_INPUT.has(input.type)) lastUserInputAt = Date.now(); });
   wc.on('did-fail-load', (_e, code, desc, url, isMain) => {
     if (isMain && code !== -3) { mainLoadFailed = true; log(`load FAILED ${code} ${desc} ${safeUrl(url)}`); }
   });
@@ -421,6 +479,7 @@ function buildMenu() {
         { label: 'Test: simulate expired login', click: () => simulateExpiry().catch((e) => log(`simulate error ${e.message}`)) },
         { label: 'Test: simulate waking from a long sleep', click: () => handleWake('simulate-sleep', LONG_SLEEP_MS) },
         { type: 'separator' },
+        { label: 'Sign out of Evernote', click: signOut },
         { label: 'Quit', accelerator: 'CmdOrCtrl+Q', click: () => { quitting = true; app.quit(); } },
       ],
     },
@@ -489,6 +548,7 @@ if (!app.requestSingleInstanceLock()) {
     watchCookies(ses);
     watchResponses(ses);
     watchLoadErrors(ses);
+    guardSignOut(ses);
     setupPermissions(ses);
     buildMenu();
     createTray();

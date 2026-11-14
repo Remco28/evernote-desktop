@@ -1,6 +1,6 @@
 {
   "name": "evernote-desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A small, dedicated desktop window for Evernote's web app, built to keep you logged in.",
   "main": "main.js",
   "private": true,
